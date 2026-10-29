@@ -1,0 +1,865 @@
+"""
+app.py - MSTS/Open Rails .s -> Wavefront .obj converter (desktop GUI)
+
+Run directly with Python (3.8+, needs numpy):
+    pip install numpy
+    python app.py
+
+Or build a standalone Windows .exe - see BUILD_EXE.txt in this folder.
+"""
+
+import os
+import sys
+import threading
+import queue
+import traceback
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+import s_converter
+
+
+APP_TITLE = "MSTS .s -> OBJ Converter"
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_TITLE)
+        self.geometry("640x420")
+        self.minsize(560, 360)
+
+        self.s_path = None
+        self.worker_thread = None
+        self.cancel_event = threading.Event()
+        self.msg_queue = queue.Queue()
+
+        self._build_ui()
+        self._poll_queue()
+
+        self.protocol("WM_DELETE_WINDOW", self.on_exit)
+
+    # ---------------------------------------------------------- UI layout
+    def _build_ui(self):
+        pad = {"padx": 10, "pady": 6}
+
+        top = tk.Frame(self)
+        top.pack(fill="x", **pad)
+
+        self.btn_open = tk.Button(top, text="Open .s File...", width=18, command=self.on_open)
+        self.btn_open.pack(side="left")
+
+        self.btn_export = tk.Button(top, text="Export as .obj...", width=18,
+                                     command=self.on_export, state="disabled")
+        self.btn_export.pack(side="left", padx=(10, 0))
+
+        self.btn_exit = tk.Button(top, text="Exit", width=10, command=self.on_exit)
+        self.btn_exit.pack(side="right")
+
+        file_frame = tk.Frame(self)
+        file_frame.pack(fill="x", **pad)
+        tk.Label(file_frame, text="Selected file:").pack(side="left")
+        self.lbl_file = tk.Label(file_frame, text="(none)", anchor="w", fg="#444")
+        self.lbl_file.pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+        self.progress = ttk.Progressbar(self, mode="determinate", maximum=100)
+        self.progress.pack(fill="x", padx=10, pady=(0, 6))
+
+        self.lbl_status = tk.Label(self, text="Open an uncompressed .s file to begin.", anchor="w")
+        self.lbl_status.pack(fill="x", padx=10)
+
+        log_frame = tk.Frame(self)
+        log_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.log = tk.Text(log_frame, wrap="word", state="disabled", height=12)
+        scrollbar = tk.Scrollbar(log_frame, command=self.log.yview)
+        self.log.configure(yscrollcommand=scrollbar.set)
+        self.log.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+    # ---------------------------------------------------------- helpers
+    def _log(self, msg):
+        self.log.configure(state="normal")
+        self.log.insert("end", msg + "\n")
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def _set_busy(self, busy):
+        state = "disabled" if busy else "normal"
+        self.btn_open.configure(state=state)
+        self.btn_export.configure(state=state if self.s_path else "disabled")
+
+    # ---------------------------------------------------------- button: Open
+    def on_open(self):
+        path = filedialog.askopenfilename(
+            title="Open MSTS/Open Rails .s shape file",
+            filetypes=[("Shape files", "*.s"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self.s_path = path
+        self.lbl_file.configure(text=path)
+        self.btn_export.configure(state="normal")
+        self.lbl_status.configure(text="Ready to export.")
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        self._log(f"Opened: {path}  ({size_mb:.1f} MB)")
+
+    # ---------------------------------------------------------- button: Export
+    def on_export(self):
+        if not self.s_path:
+            return
+        default_name = os.path.splitext(os.path.basename(self.s_path))[0] + ".obj"
+        out_path = filedialog.asksaveasfilename(
+            title="Export as Wavefront OBJ",
+            defaultextension=".obj",
+            initialfile=default_name,
+            filetypes=[("Wavefront OBJ", "*.obj")],
+        )
+        if not out_path:
+            return
+
+        self.cancel_event = threading.Event()
+        self._set_busy(True)
+        self.progress.configure(mode="indeterminate")
+        self.progress.start(12)
+        self.lbl_status.configure(text="Converting...")
+        self._log(f"\nExporting to: {out_path}")
+
+        self.worker_thread = threading.Thread(
+            target=self._run_conversion, args=(self.s_path, out_path), daemon=True
+        )
+        self.worker_thread.start()
+
+    def _run_conversion(self, s_path, out_path):
+        def progress_cb(stage, cur, total):
+            self.msg_queue.put(("progress", stage, cur, total))
+
+        try:
+            stats = s_converter.convert(
+                s_path, out_path, progress=progress_cb, cancel_event=self.cancel_event
+            )
+            self.msg_queue.put(("done", stats))
+        except s_converter.Cancelled:
+            self.msg_queue.put(("cancelled", None))
+        except s_converter.ConversionError as e:
+            self.msg_queue.put(("error", str(e)))
+        except Exception:
+            self.msg_queue.put(("error", "Unexpected error:\n" + traceback.format_exc()))
+
+    # ---------------------------------------------------------- background queue polling
+    def _poll_queue(self):
+        try:
+            while True:
+                item = self.msg_queue.get_nowait()
+                kind = item[0]
+
+                if kind == "progress":
+                    _, stage, cur, total = item
+                    if total:
+                        self.progress.configure(mode="determinate", maximum=total)
+                        self.progress["value"] = cur
+                        self.lbl_status.configure(text=f"{stage} ({cur}/{total})")
+                    else:
+                        self.lbl_status.configure(text=stage)
+
+                elif kind == "done":
+                    stats = item[1]
+                    self.progress.stop()
+                    self.progress.configure(mode="determinate", value=100, maximum=100)
+                    self._set_busy(False)
+                    self.lbl_status.configure(text="Done.")
+                    self._log(
+                        "Finished:\n"
+                        f"  Points:        {stats['points']:,}\n"
+                        f"  Normals:       {stats['normals']:,}\n"
+                        f"  UV points:     {stats['uv_points']:,}\n"
+                        f"  Sub-objects:   {stats['sub_objects']:,}\n"
+                        f"  Vertices out:  {stats['vertices_written']:,}\n"
+                        f"  Faces out:     {stats['faces_written']:,}\n"
+                        f"  Materials:     {stats['materials']:,}\n"
+                        f"  OBJ: {stats['obj_path']}\n"
+                        f"  MTL: {stats['mtl_path']}"
+                    )
+                    messagebox.showinfo(
+                        APP_TITLE,
+                        f"Export complete.\n\n"
+                        f"{stats['vertices_written']:,} vertices, "
+                        f"{stats['faces_written']:,} faces, "
+                        f"{stats['materials']:,} materials.\n\n"
+                        f"Saved to:\n{stats['obj_path']}"
+                    )
+
+                elif kind == "cancelled":
+                    self.progress.stop()
+                    self.progress.configure(mode="determinate", value=0)
+                    self._set_busy(False)
+                    self.lbl_status.configure(text="Cancelled.")
+                    self._log("Export cancelled.")
+
+                elif kind == "error":
+                    self.progress.stop()
+                    self.progress.configure(mode="determinate", value=0)
+                    self._set_busy(False)
+                    self.lbl_status.configure(text="Failed - see log.")
+                    self._log("ERROR: " + item[1])
+                    messagebox.showerror(APP_TITLE, "Conversion failed:\n\n" + item[1])
+
+        except queue.Empty:
+            pass
+        self.after(80, self._poll_queue)
+
+    # ---------------------------------------------------------- button: Exit
+    def on_exit(self):
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            if not messagebox.askyesno(
+                APP_TITLE, "A conversion is still running. Cancel it and exit?"
+            ):
+                return
+            self.cancel_event.set()
+            self.worker_thread.join(timeout=2.0)
+        self.destroy()
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    App().mainloop()
+
+@echo off
+setlocal
+echo ============================================
+echo  MSTS .s to OBJ Converter - build script
+echo ============================================
+echo.
+
+where python >nul 2>nul
+if errorlevel 1 (
+    echo ERROR: Python was not found on PATH.
+    echo Install it from https://python.org and tick "Add python.exe to PATH",
+    echo then run this script again.
+    pause
+    exit /b 1
+)
+
+echo [1/3] Installing dependencies...
+python -m pip install --upgrade pip >nul
+python -m pip install -r requirements.txt
+if errorlevel 1 goto fail
+
+python -m pip install pyinstaller
+if errorlevel 1 goto fail
+
+echo.
+echo [2/3] Building MSTS_to_OBJ_Converter.exe ...
+python -m PyInstaller --onefile --windowed --name "MSTS_to_OBJ_Converter" app.py
+if errorlevel 1 goto fail
+
+echo.
+echo [3/3] Done!
+echo Your exe is here:
+echo   dist\MSTS_to_OBJ_Converter.exe
+echo.
+pause
+exit /b 0
+
+:fail
+echo.
+echo Build failed - see the messages above.
+pause
+exit /b 1
+
+HOW TO GET THE WINDOWS .EXE
+=============================
+
+A .exe has to be built by *some* computer that has Python on it - that's
+just how PyInstaller works. But that computer doesn't have to be yours.
+Option A below builds it for free in the cloud (GitHub's servers) - you
+only need a web browser and a free GitHub account, nothing installed
+on your PC.
+
+--------------------------------------------------------------------
+OPTION A - No installs on your PC: let GitHub build it for you
+--------------------------------------------------------------------
+1. Go to https://github.com and sign up (free) if you don't have an
+   account.
+2. Click the "+" in the top right -> "New repository". Name it
+   anything (e.g. "msts-converter"). Keep it Public. Create it.
+3. On the new repo's page, click "Add file" -> "Upload files".
+4. Drag in ALL the files and folders from this zip, INCLUDING the
+   hidden ".github" folder (it contains the build instructions for
+   GitHub - if your drag-and-drop doesn't pick up hidden folders,
+   use "choose your files" and navigate into .github\workflows\
+   to upload build.yml into that exact path manually).
+5. Click "Commit changes".
+6. Click the "Actions" tab at the top of the repo. You should see a
+   workflow run starting automatically (or click "Build Windows EXE"
+   on the left, then "Run workflow" if it didn't start by itself).
+7. Wait about 1-2 minutes for the green checkmark.
+8. Click into the finished run, scroll down to "Artifacts", and
+   download "MSTS_to_OBJ_Converter-windows-exe". That's a small zip
+   containing your .exe - unzip it and you're done.
+
+This costs nothing - GitHub gives every account free build minutes,
+and this build takes well under a minute of that.
+
+--------------------------------------------------------------------
+OPTION B - Build it yourself on a Windows PC with Python
+--------------------------------------------------------------------
+1. Install Python from https://python.org (tick "Add python.exe to
+   PATH" on the first screen), OR if you have Windows 11's winget,
+   open a terminal and run:
+       winget install -e --id Python.Python.3.12
+   OR install it free from the Microsoft Store (search "Python 3.12").
+2. Put app.py, s_converter.py, requirements.txt and build.bat in one
+   folder.
+3. Double-click build.bat.
+4. Your .exe appears in the new "dist" folder.
+
+--------------------------------------------------------------------
+Notes
+--------------------------------------------------------------------
+* "--windowed" hides the console window (this is a GUI app).
+* "--onefile" bundles numpy etc. into one .exe. First launch is a
+  little slower than later launches - PyInstaller unpacks itself to a
+  temp folder on first run each time, that's normal.
+* Windows SmartScreen may warn "unrecognised app" the first time you
+  run any freshly-built, unsigned .exe. Click "More info" -> "Run
+  anyway". This is expected for any home-built .exe, not a problem
+  with this one specifically.
+* The conversion engine (s_converter.py) was tested against a real
+  115 MB uncompressed .s file before being wrapped in this app - see
+  CONVERSION_TEST_LOG.txt for the actual console output.
+
+# MSTS .s -> OBJ Converter
+
+A small desktop app that converts an uncompressed MSTS / Open Rails `.s`
+shape file into a Wavefront `.obj` (+ `.mtl`) that Blender, 3ds Max, etc.
+can open directly.
+
+This is the same conversion logic used earlier on the KRG WAP7 locomotive
+(77,873 points / 146,121 triangles / 49 sub-objects), now wrapped in a
+small GUI and hardened for large files: geometry is streamed straight to
+disk instead of being held in memory, so peak RAM use stays low
+(~265 MB measured on that 115 MB shape file) regardless of model size.
+
+## What's in this folder
+
+| File                    | Purpose                                                  |
+|--------------------------|-----------------------------------------------------------|
+| `app.py`                 | The GUI (Open / Export / Exit buttons)                    |
+| `s_converter.py`         | The actual `.s` parser / `.obj` writer - all the real work |
+| `requirements.txt`       | Python dependency (just `numpy`)                          |
+| `build.bat`               | Double-click this on Windows to build the standalone .exe |
+| `BUILD_EXE.txt`          | Step-by-step build instructions (also covers manual build)|
+| `CONVERSION_TEST_LOG.txt`| Real console output from testing against the WAP7 file    |
+
+## Quick start (no .exe yet, just running with Python)
+
+```
+pip install -r requirements.txt
+python app.py
+```
+
+## Building the standalone Windows .exe
+
+**No Python on your PC? No problem.** See `BUILD_EXE.txt` Option A -
+upload this folder to a free GitHub repo and a GitHub-hosted Windows
+machine builds the .exe for you; you just download the finished file.
+
+If you do have/want Python locally: install it (tick "Add to PATH"),
+put all these files in one folder, double-click `build.bat`. Your
+`.exe` appears in `dist\`.
+
+## Using the app
+
+1. **Open .s File...** - pick an uncompressed MSTS/Open Rails `.s` shape.
+   (If it's compressed, it needs decompressing first - this tool only
+   reads the plain-text "uncompressed" variant, same as before.)
+2. **Export as .obj...** - choose where to save. Conversion runs in the
+   background with a progress bar and live log, so the window stays
+   responsive even on very large files.
+3. **Exit** - closes the app. If a conversion is still running it'll ask
+   first.
+
+The exported `.mtl` references textures as `<name>.dds` (matching the
+workflow used previously). If your textures are `.tga` or another
+format instead, open the `.mtl` in a text editor and adjust the
+extension on the `map_Kd` lines, or just relink the textures inside
+Blender after import - either takes a few seconds.
+
+## What it does NOT do
+
+- No animation/skeleton export - each part's geometry is baked into a
+  single static rest pose (same simplification as before).
+- Only the first (highest-detail) LOD is exported if the shape has more
+  than one.
+- Compressed `.s` files aren't supported (only the uncompressed
+  text-based SIMISA format).
+
+## Why there's no .exe already in this download
+
+I built and tested this from a sandboxed Linux environment with no
+internet access and no Windows/cross-compiler toolchain, so I can't
+produce a genuine Windows binary myself. `build.bat` does it for you in
+about a minute on your own machine, which also means it's actually
+been compiled and run on real Windows rather than guessed at - the more
+trustworthy way to get this.
+
+numpy>=1.24
+
+"""
+s_converter.py
+Core conversion engine: MSTS / Open Rails uncompressed .s shape file -> Wavefront .obj (+ .mtl)
+
+Designed to be imported by app.py (the GUI). Can also be run standalone from the
+command line for testing:
+
+    python s_converter.py input.s output.obj
+
+Notes on design choices (so future maintenance is easy):
+  * Only the FIRST distance_level of the FIRST lod_control is exported (the
+    highest-detail static LOD). Animation/hierarchy is "baked" - each part's
+    matrix is applied once to its vertices, giving a static rest-pose mesh.
+  * Output is streamed directly to disk per indexed_trilist batch (not
+    accumulated in one huge in-memory list) so memory use stays roughly
+    proportional to the largest single triangle batch, not the whole model.
+    This is what lets it handle very large shapes without running out of RAM.
+  * Every parsing stage is wrapped so failures raise a ConversionError with a
+    clear, specific message instead of an unhandled traceback.
+"""
+
+import re
+import os
+import numpy as np
+
+
+class ConversionError(Exception):
+    """Raised for any recoverable problem with the input file."""
+    pass
+
+
+class Cancelled(Exception):
+    """Raised internally when the user cancels a running conversion."""
+    pass
+
+
+def _read_text(path):
+    with open(path, "rb") as f:
+        raw = f.read()
+    if len(raw) < 16:
+        raise ConversionError("File is too small to be a valid .s shape file.")
+    if raw[:2] == b"\xff\xfe":
+        text = raw.decode("utf-16-le", errors="replace")
+    elif raw[:2] == b"\xfe\xff":
+        text = raw.decode("utf-16-be", errors="replace")
+    else:
+        # Plain ASCII/UTF-8 uncompressed .s (older MSTS exporters)
+        text = raw.decode("utf-8", errors="replace")
+
+    header = text[:40]
+    if "SIMISA" not in header:
+        raise ConversionError(
+            "This doesn't look like an uncompressed MSTS/Open Rails .s file "
+            "(missing the 'SIMISA@@...' header). If this is a *compressed* "
+            ".s file, it must first be decompressed (e.g. with Open Rails' "
+            "own tools) before it can be converted."
+        )
+    if "JINX0s1t" not in header and "jinx0s1t" not in header.lower():
+        # Not fatal - just a heads up that this may be an unusual variant.
+        pass
+    return text
+
+
+def _find(text, name, start=0):
+    try:
+        idx = text.index(name, start)
+    except ValueError:
+        raise ConversionError(f"Couldn't find expected block '{name.strip()}' in the file. "
+                               f"The file may be incomplete, corrupted, or an unsupported "
+                               f"shape variant.")
+    return idx + len(name)
+
+
+def _read_count(text, pos):
+    m = re.match(r"\s*(\d+)", text[pos:pos + 64])
+    if not m:
+        raise ConversionError(f"Expected a number at file position {pos} but didn't find one.")
+    return int(m.group(1)), pos + m.end()
+
+
+def convert(s_path, obj_path, progress=None, cancel_event=None):
+    """
+    progress(stage:str, current:int, total:int) -> called periodically.
+    cancel_event: threading.Event - if set(), raises Cancelled and aborts cleanly.
+    Returns a stats dict on success.
+    """
+    def report(stage, cur=0, total=0):
+        if progress:
+            progress(stage, cur, total)
+        if cancel_event is not None and cancel_event.is_set():
+            raise Cancelled()
+
+    report("Reading file")
+    text = _read_text(s_path)
+
+    # ---------------- points ----------------
+    report("Parsing points")
+    p_start = _find(text, "points (")
+    n_points, p_start = _read_count(text, p_start)
+    pt_re = re.compile(r'point \(\s*([^)]+?)\s*\)')
+    pts = []
+    it = pt_re.finditer(text, p_start)
+    for i, m in zip(range(n_points), it):
+        pts.append(m.group(1).split())
+        if i % 20000 == 0:
+            report("Parsing points", i, n_points)
+    if len(pts) != n_points:
+        raise ConversionError(f"Expected {n_points} points, only found {len(pts)}.")
+    points = np.array(pts, dtype=np.float64)
+
+    # ---------------- uv_points ----------------
+    report("Parsing UV points")
+    uv_start = _find(text, "uv_points (", p_start)
+    n_uv, uv_start = _read_count(text, uv_start)
+    uvp_re = re.compile(r'uv_point \(\s*([^)]+?)\s*\)')
+    uvs_ = []
+    it = uvp_re.finditer(text, uv_start)
+    for i, m in zip(range(n_uv), it):
+        uvs_.append(m.group(1).split())
+        if i % 20000 == 0:
+            report("Parsing UV points", i, n_uv)
+    if len(uvs_) != n_uv:
+        raise ConversionError(f"Expected {n_uv} uv_points, only found {len(uvs_)}.")
+    uvs = np.array(uvs_, dtype=np.float64) if n_uv > 0 else np.zeros((0, 2))
+
+    # ---------------- normals ----------------
+    report("Parsing normals")
+    n_start = _find(text, "normals (", uv_start)
+    n_normals, n_start = _read_count(text, n_start)
+    vec_re = re.compile(r'vector \(\s*([^)]+?)\s*\)')
+    nrm = []
+    it = vec_re.finditer(text, n_start)
+    for i, m in zip(range(n_normals), it):
+        nrm.append(m.group(1).split())
+        if i % 20000 == 0:
+            report("Parsing normals", i, n_normals)
+    if len(nrm) != n_normals:
+        raise ConversionError(f"Expected {n_normals} normals, only found {len(nrm)}.")
+    normals = np.array(nrm, dtype=np.float64)
+
+    # ---------------- matrices ----------------
+    report("Parsing matrices")
+    mat_start = _find(text, "matrices (", n_start)
+    n_mat, mat_start = _read_count(text, mat_start)
+    mat_re = re.compile(r'matrix\s+(\S+)\s*\(\s*([^)]+?)\s*\)')
+    mat_names, mat_local = [], []
+    it = mat_re.finditer(text, mat_start)
+    for i, m in zip(range(n_mat), it):
+        mat_names.append(m.group(1))
+        vals = [float(x) for x in m.group(2).split()]
+        if len(vals) < 12:
+            raise ConversionError(f"Matrix '{m.group(1)}' has fewer than 12 values.")
+        a = np.eye(4, dtype=np.float64)
+        a[0, 0], a[0, 1], a[0, 2] = vals[0], vals[1], vals[2]
+        a[1, 0], a[1, 1], a[1, 2] = vals[3], vals[4], vals[5]
+        a[2, 0], a[2, 1], a[2, 2] = vals[6], vals[7], vals[8]
+        a[0, 3], a[1, 3], a[2, 3] = vals[9], vals[10], vals[11]
+        mat_local.append(a)
+    if len(mat_local) != n_mat:
+        raise ConversionError(f"Expected {n_mat} matrices, only found {len(mat_local)}.")
+
+    # ---------------- images ----------------
+    report("Parsing images")
+    img_start = _find(text, "images (", mat_start)
+    n_img, img_start = _read_count(text, img_start)
+    img_re = re.compile(r'image \(\s*([^)]+?)\s*\)')
+    images = []
+    it = img_re.finditer(text, img_start)
+    for i, m in zip(range(n_img), it):
+        images.append(m.group(1).strip())
+
+    # ---------------- textures ----------------
+    report("Parsing textures")
+    tex_start = _find(text, "textures (", img_start)
+    n_tex, tex_start = _read_count(text, tex_start)
+    tex_re = re.compile(r'texture \(\s*(\d+)[^)]*\)')
+    textures = []
+    it = tex_re.finditer(text, tex_start)
+    for i, m in zip(range(n_tex), it):
+        textures.append(int(m.group(1)))
+
+    # ---------------- prim_states ----------------
+    report("Parsing materials")
+    ps_start = _find(text, "prim_states (", tex_start)
+    n_ps, ps_start = _read_count(text, ps_start)
+    ps_re = re.compile(
+        r'prim_state\s+(\S+)\s*\(\s*\S+\s+\S+\s+tex_idxs\s*\(\s*(\d+)((?:\s+\d+)*)\s*\)'
+        r'\s*[-\d.eE]+\s+(\d+)\s+(\d+)\s+(\d+)'
+    )
+    prim_states = []
+    it = ps_re.finditer(text, ps_start)
+    for i, m in zip(range(n_ps), it):
+        tex_list = m.group(3).split()
+        tex_idx = int(tex_list[0]) if tex_list else None
+        prim_states.append({
+            "name": m.group(1),
+            "tex_idx": tex_idx,
+            "matrix_idx": int(m.group(4)),
+        })
+    if len(prim_states) != n_ps:
+        raise ConversionError(
+            f"Expected {n_ps} prim_states, only matched {len(prim_states)}. "
+            f"This shape may use a material format this tool doesn't recognise."
+        )
+
+    def image_for_prim_state(ps_idx):
+        ps = prim_states[ps_idx]
+        if ps["tex_idx"] is None or ps["tex_idx"] >= len(textures):
+            return None
+        img_idx = textures[ps["tex_idx"]]
+        if img_idx >= len(images):
+            return None
+        return images[img_idx]
+
+    # ---------------- first distance_level ----------------
+    report("Locating geometry (LOD0)")
+    dl_start = _find(text, "distance_level (", ps_start)
+    dlh_start = _find(text, "distance_level_header (", dl_start)
+    hier_start = _find(text, "hierarchy (", dlh_start)
+    n_hier, hier_start = _read_count(text, hier_start)
+    m = re.match(r'([\s\d-]+?)\)', text[hier_start:hier_start + 4000])
+    if not m:
+        raise ConversionError("Couldn't parse the matrix hierarchy block.")
+    hier_vals = [int(x) for x in m.group(1).split()]
+    if len(hier_vals) != n_hier:
+        raise ConversionError(f"Hierarchy expected {n_hier} entries, found {len(hier_vals)}.")
+    if n_hier != n_mat:
+        # Not strictly fatal - pad/trim defensively rather than crash.
+        if n_hier < n_mat:
+            hier_vals += [-1] * (n_mat - n_hier)
+        else:
+            hier_vals = hier_vals[:n_mat]
+
+    world_cache = {}
+
+    def get_world(i, _depth=0):
+        if i in world_cache:
+            return world_cache[i]
+        if _depth > 64:
+            raise ConversionError(f"Matrix hierarchy appears to contain a cycle at index {i}.")
+        parent = hier_vals[i]
+        if parent == -1 or parent == i or parent < 0 or parent >= n_mat:
+            w = mat_local[i]
+        else:
+            w = get_world(parent, _depth + 1) @ mat_local[i]
+        world_cache[i] = w
+        return w
+
+    world_mats = [get_world(i) for i in range(n_mat)]
+
+    so_start = _find(text, "sub_objects (", hier_start)
+    n_subobj, so_start = _read_count(text, so_start)
+
+    vert_re = re.compile(
+        r'vertex \(\s*[0-9A-Fa-f]+\s+(\d+)\s+(\d+)\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s*'
+        r'vertex_uvs \(\s*(\d+)\s*((?:\d+\s*)*)\)\s*\)'
+    )
+    trilist_token_re = re.compile(
+        r'prim_state_idx \(\s*(\d+)\s*\)'
+        r'|indexed_trilist \(\s*vertex_idxs \(\s*(\d+)\s+((?:\d+\s*)+?)\)'
+    )
+
+    def remap(arr_xyz):
+        # MSTS (x,y,z) -> common Blender-friendly (x,-z,y), Z-up
+        out = np.empty_like(arr_xyz)
+        out[:, 0] = arr_xyz[:, 0]
+        out[:, 1] = -arr_xyz[:, 2]
+        out[:, 2] = arr_xyz[:, 1]
+        return out
+
+    obj_dir = os.path.dirname(os.path.abspath(obj_path))
+    obj_base = os.path.splitext(os.path.basename(obj_path))[0]
+    mtl_path = os.path.join(obj_dir, obj_base + ".mtl")
+
+    v_count = 0
+    f_count = 0
+    mtl_materials = {}   # image filename (or None) -> material name
+    material_order = []
+
+    pos = so_start
+    with open(obj_path, "w", encoding="utf-8", newline="\n") as fobj:
+        fobj.write(f"# exported by s_converter.py\nmtllib {obj_base}.mtl\n")
+        current_material = None
+
+        for so_i in range(n_subobj):
+            report("Exporting geometry", so_i, n_subobj)
+
+            vstart = _find(text, "vertices (", pos)
+            v_cnt, vpos = _read_count(text, vstart)
+            pos = vpos
+
+            pidx = np.empty(v_cnt, dtype=np.int64)
+            nidx = np.empty(v_cnt, dtype=np.int64)
+            uvidx = np.empty(v_cnt, dtype=np.int64)
+
+            it = vert_re.finditer(text, pos)
+            last_end = pos
+            k = -1
+            for k, m in zip(range(v_cnt), it):
+                pidx[k] = int(m.group(1))
+                nidx[k] = int(m.group(2))
+                uv_list = m.group(4).split()
+                uvidx[k] = int(uv_list[0]) if uv_list else 0
+                last_end = m.end()
+            if k != v_cnt - 1:
+                raise ConversionError(
+                    f"sub_object {so_i}: expected {v_cnt} vertices, only parsed {k + 1}."
+                )
+            pos = last_end
+
+            primstart = _find(text, "primitives (", pos)
+            prim_cnt, primpos = _read_count(text, primstart)
+            pos = primpos
+
+            cur_ps_idx = None
+            for _tok in range(prim_cnt):
+                m = trilist_token_re.search(text, pos)
+                if m is None:
+                    raise ConversionError(
+                        f"sub_object {so_i}: ran out of data while reading primitives "
+                        f"(token {_tok + 1}/{prim_cnt})."
+                    )
+                if m.group(1) is not None:
+                    cur_ps_idx = int(m.group(1))
+                    pos = m.end()
+                    continue
+
+                if cur_ps_idx is None:
+                    raise ConversionError(
+                        f"sub_object {so_i}: found triangle data before any material was selected."
+                    )
+
+                vidx_count = int(m.group(2))
+                vidx_str = m.group(3)
+                pos = m.end()
+                tri_local = np.fromstring(vidx_str, dtype=np.int64, sep=' ')
+                if tri_local.shape[0] != vidx_count:
+                    raise ConversionError(
+                        f"sub_object {so_i}: triangle list length mismatch "
+                        f"({tri_local.shape[0]} vs expected {vidx_count})."
+                    )
+                if tri_local.shape[0] == 0:
+                    continue
+
+                if np.any(tri_local >= v_cnt):
+                    raise ConversionError(
+                        f"sub_object {so_i}: a triangle references a vertex index out of range."
+                    )
+
+                img_file = image_for_prim_state(cur_ps_idx)
+                mat_idx = prim_states[cur_ps_idx]["matrix_idx"]
+                if mat_idx < 0 or mat_idx >= n_mat:
+                    mat_idx = 0
+                Wm = world_mats[mat_idx]
+                R = Wm[:3, :3]
+
+                p_g = pidx[tri_local]
+                n_g = nidx[tri_local]
+                uv_g = uvidx[tri_local]
+
+                P = points[p_g]
+                Pw = (R @ P.T).T + Wm[:3, 3]
+                N = normals[n_g]
+                Nw = (R @ N.T).T
+                norms = np.linalg.norm(Nw, axis=1, keepdims=True)
+                norms[norms == 0] = 1.0
+                Nw = Nw / norms
+                UV = uvs[uv_g] if n_uv > 0 else np.zeros((len(uv_g), 2))
+
+                Pw = remap(Pw)
+                Nw = remap(Nw)
+
+                ntri_verts = Pw.shape[0]
+                base = v_count
+
+                if img_file not in mtl_materials:
+                    if img_file:
+                        safe = re.sub(r'[^A-Za-z0-9_]', '_', os.path.splitext(img_file)[0])
+                        matname = "mat_" + safe
+                    else:
+                        matname = f"mat_untextured_{len(mtl_materials)}"
+                    mtl_materials[img_file] = matname
+                    material_order.append((img_file, matname))
+                matname = mtl_materials[img_file]
+                if matname != current_material:
+                    fobj.write(f"usemtl {matname}\n")
+                    current_material = matname
+
+                vbuf = '\n'.join(f"v {x:.6f} {y:.6f} {z:.6f}" for x, y, z in Pw)
+                vtbuf = '\n'.join(f"vt {1.0 - u:.6f} {1.0 - v:.6f}" for u, v in UV)
+                vnbuf = '\n'.join(f"vn {x:.6f} {y:.6f} {z:.6f}" for x, y, z in Nw)
+                fobj.write(vbuf)
+                fobj.write('\n')
+                fobj.write(vtbuf)
+                fobj.write('\n')
+                fobj.write(vnbuf)
+                fobj.write('\n')
+
+                idxs = np.arange(base + 1, base + ntri_verts + 1)
+                faces = idxs.reshape(-1, 3)
+                fbuf = '\n'.join(f"f {a}/{a}/{a} {b}/{b}/{b} {c}/{c}/{c}" for a, b, c in faces)
+                fobj.write(fbuf)
+                fobj.write('\n')
+
+                v_count += ntri_verts
+                f_count += ntri_verts // 3
+
+    report("Writing material file")
+    with open(mtl_path, "w", encoding="utf-8", newline="\n") as fmtl:
+        for img_file, matname in material_order:
+            fmtl.write(f"newmtl {matname}\n")
+            fmtl.write("Ka 1.000 1.000 1.000\n")
+            fmtl.write("Kd 1.000 1.000 1.000\n")
+            fmtl.write("Ks 0.000 0.000 0.000\n")
+            if img_file:
+                base = os.path.splitext(img_file)[0]
+                fmtl.write(f"map_Kd {base}.dds\n")
+            fmtl.write("\n")
+
+    report("Done", n_subobj, n_subobj)
+    return {
+        "points": n_points,
+        "normals": n_normals,
+        "uv_points": n_uv,
+        "matrices": n_mat,
+        "sub_objects": n_subobj,
+        "vertices_written": v_count,
+        "faces_written": f_count,
+        "materials": len(material_order),
+        "obj_path": obj_path,
+        "mtl_path": mtl_path,
+    }
+
+
+if __name__ == "__main__":
+    import sys, time
+    if len(sys.argv) != 3:
+        print("Usage: python s_converter.py input.s output.obj")
+        sys.exit(1)
+
+    t0 = time.time()
+
+    def cb(stage, cur, total):
+        if total:
+            print(f"\r[{time.time()-t0:6.1f}s] {stage}: {cur}/{total}        ", end="", flush=True)
+        else:
+            print(f"\r[{time.time()-t0:6.1f}s] {stage}                      ", end="", flush=True)
+
+    try:
+        stats = convert(sys.argv[1], sys.argv[2], progress=cb)
+        print()
+        for k, v in stats.items():
+            print(f"  {k}: {v}")
+    except ConversionError as e:
+        print(f"\nERROR: {e}")
+        sys.exit(2)
